@@ -1,100 +1,116 @@
-# Copyright 2016 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+from fontTools.misc import sstruct
+from fontTools.misc.textTools import bytechr, byteord, strjoin
+from . import DefaultTable
+import array
+from collections.abc import Mapping
 
-"""Cryptography helpers for verifying and signing messages.
-
-The simplest way to verify signatures is using :func:`verify_signature`::
-
-    cert = open('certs.pem').read()
-    valid = crypt.verify_signature(message, signature, cert)
-
-If you're going to verify many messages with the same certificate, you can use
-:class:`RSAVerifier`::
-
-    cert = open('certs.pem').read()
-    verifier = crypt.RSAVerifier.from_string(cert)
-    valid = verifier.verify(message, signature)
-
-To sign messages use :class:`RSASigner` with a private key::
-
-    private_key = open('private_key.pem').read()
-    signer = crypt.RSASigner.from_string(private_key)
-    signature = signer.sign(message)
-
-The code above also works for :class:`ES256Signer` and :class:`ES256Verifier`.
-Note that these two classes are only available if your `cryptography` dependency
-version is at least 1.4.0.
+hdmxHeaderFormat = """
+	>   # big endian!
+	version:	H
+	numRecords:	H
+	recordSize:	l
 """
 
-import six
+class _GlyphnamedList(Mapping):
 
-from google.auth.crypt import base
-from google.auth.crypt import rsa
+	def __init__(self, reverseGlyphOrder, data):
+		self._array = data
+		self._map = dict(reverseGlyphOrder)
 
-try:
-    from google.auth.crypt import es256
-except ImportError:  # pragma: NO COVER
-    es256 = None  # type: ignore
+	def __getitem__(self, k):
+		return self._array[self._map[k]]
 
-if es256 is not None:  # pragma: NO COVER
-    __all__ = [
-        "ES256Signer",
-        "ES256Verifier",
-        "RSASigner",
-        "RSAVerifier",
-        "Signer",
-        "Verifier",
-    ]
-else:  # pragma: NO COVER
-    __all__ = ["RSASigner", "RSAVerifier", "Signer", "Verifier"]
+	def __len__(self):
+		return len(self._map)
 
+	def __iter__(self):
+		return iter(self._map)
 
-# Aliases to maintain the v1.0.0 interface, as the crypt module was split
-# into submodules.
-Signer = base.Signer
-Verifier = base.Verifier
-RSASigner = rsa.RSASigner
-RSAVerifier = rsa.RSAVerifier
+	def keys(self):
+		return self._map.keys()
 
-if es256 is not None:  # pragma: NO COVER
-    ES256Signer = es256.ES256Signer
-    ES256Verifier = es256.ES256Verifier
+class table__h_d_m_x(DefaultTable.DefaultTable):
 
+	def decompile(self, data, ttFont):
+		numGlyphs = ttFont['maxp'].numGlyphs
+		glyphOrder = ttFont.getGlyphOrder()
+		dummy, data = sstruct.unpack2(hdmxHeaderFormat, data, self)
+		self.hdmx = {}
+		for i in range(self.numRecords):
+			ppem = byteord(data[0])
+			maxSize = byteord(data[1])
+			widths = _GlyphnamedList(ttFont.getReverseGlyphMap(), array.array("B", data[2:2+numGlyphs]))
+			self.hdmx[ppem] = widths
+			data = data[self.recordSize:]
+		assert len(data) == 0, "too much hdmx data"
 
-def verify_signature(message, signature, certs, verifier_cls=rsa.RSAVerifier):
-    """Verify an RSA or ECDSA cryptographic signature.
+	def compile(self, ttFont):
+		self.version = 0
+		numGlyphs = ttFont['maxp'].numGlyphs
+		glyphOrder = ttFont.getGlyphOrder()
+		self.recordSize = 4 * ((2 + numGlyphs + 3) // 4)
+		pad = (self.recordSize - 2 - numGlyphs) * b"\0"
+		self.numRecords = len(self.hdmx)
+		data = sstruct.pack(hdmxHeaderFormat, self)
+		items = sorted(self.hdmx.items())
+		for ppem, widths in items:
+			data = data + bytechr(ppem) + bytechr(max(widths.values()))
+			for glyphID in range(len(glyphOrder)):
+				width = widths[glyphOrder[glyphID]]
+				data = data + bytechr(width)
+			data = data + pad
+		return data
 
-    Checks that the provided ``signature`` was generated from ``bytes`` using
-    the private key associated with the ``cert``.
+	def toXML(self, writer, ttFont):
+		writer.begintag("hdmxData")
+		writer.newline()
+		ppems = sorted(self.hdmx.keys())
+		records = []
+		format = ""
+		for ppem in ppems:
+			widths = self.hdmx[ppem]
+			records.append(widths)
+			format = format + "%4d"
+		glyphNames = ttFont.getGlyphOrder()[:]
+		glyphNames.sort()
+		maxNameLen = max(map(len, glyphNames))
+		format = "%" + repr(maxNameLen) + 's:' + format + ' ;'
+		writer.write(format % (("ppem",) + tuple(ppems)))
+		writer.newline()
+		writer.newline()
+		for glyphName in glyphNames:
+			row = []
+			for ppem in ppems:
+				widths = self.hdmx[ppem]
+				row.append(widths[glyphName])
+			if ";" in glyphName:
+				glyphName = "\\x3b".join(glyphName.split(";"))
+			writer.write(format % ((glyphName,) + tuple(row)))
+			writer.newline()
+		writer.endtag("hdmxData")
+		writer.newline()
 
-    Args:
-        message (Union[str, bytes]): The plaintext message.
-        signature (Union[str, bytes]): The cryptographic signature to check.
-        certs (Union[Sequence, str, bytes]): The certificate or certificates
-            to use to check the signature.
-        verifier_cls (Optional[~google.auth.crypt.base.Signer]): Which verifier
-            class to use for verification. This can be used to select different
-            algorithms, such as RSA or ECDSA. Default value is :class:`RSAVerifier`.
-
-    Returns:
-        bool: True if the signature is valid, otherwise False.
-    """
-    if isinstance(certs, (six.text_type, six.binary_type)):
-        certs = [certs]
-
-    for cert in certs:
-        verifier = verifier_cls.from_string(cert)
-        if verifier.verify(message, signature):
-            return True
-    return False
+	def fromXML(self, name, attrs, content, ttFont):
+		if name != "hdmxData":
+			return
+		content = strjoin(content)
+		lines = content.split(";")
+		topRow = lines[0].split()
+		assert topRow[0] == "ppem:", "illegal hdmx format"
+		ppems = list(map(int, topRow[1:]))
+		self.hdmx = hdmx = {}
+		for ppem in ppems:
+			hdmx[ppem] = {}
+		lines = (line.split() for line in lines[1:])
+		for line in lines:
+			if not line:
+				continue
+			assert line[0][-1] == ":", "illegal hdmx format"
+			glyphName = line[0][:-1]
+			if "\\" in glyphName:
+				from fontTools.misc.textTools import safeEval
+				glyphName = safeEval('"""' + glyphName + '"""')
+			line = list(map(int, line[1:]))
+			assert len(line) == len(ppems), "illegal hdmx format"
+			for i in range(len(ppems)):
+				hdmx[ppems[i]][glyphName] = line[i]
